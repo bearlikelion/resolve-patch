@@ -30,7 +30,3 @@ python resolvepatch.py --path X     # specify custom Resolve.exe path
 ```powershell
 python resolvepatch.py --restore
 ```
-
-## License
-
-MIT
