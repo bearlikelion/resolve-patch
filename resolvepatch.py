@@ -1,9 +1,6 @@
 """resolvepatch — patch DaVinci Resolve.exe to bypass license checks.
 
-Supports Resolve 21.x on Windows.
-
-The v21 chooser bypass (the "Activate DaVinci Resolve Studio" License Key /
-Cloud ID dialog was discovered via Frida runtime tracing.
+Verified on Resolve 20.3.2.9 and 21.0.0.28 on Windows.
 
 Usage (run as Administrator):
     python resolvepatch.py                 # patch the auto-located Resolve.exe
@@ -96,9 +93,9 @@ def _je_to_jmp_preserving_target(data, addr, _sig):
 
 
 def _force_first_jne_to_jmp(data, addr, _sig):
-    """v21 chooser bypass — see PATCHES_20 entry for context.
+    """v21 chooser bypass — see PATCHES_21 entry.
 
-    Pattern is 28 bytes; bytes [22..27] are `0F 85 disp32` (jne 0x140D8718C).
+    Pattern is 28 bytes; bytes [22..27] are `0F 85 disp32` (jne early_exit).
     Convert to `90 E9 disp32` (nop+jmp, same target via preserved displacement).
     The license-check function then unconditionally takes the early-exit
     success branch and never reaches dialog construction."""
@@ -107,33 +104,31 @@ def _force_first_jne_to_jmp(data, addr, _sig):
             + bytes(data[addr + 24:addr + 28]))
 
 
+def _force_first_je_to_jmp_v20(data, addr, _sig):
+    """v20.3.x chooser bypass — see PATCHES_20 entry.
+
+    Pattern is 41 bytes; bytes [35..40] are `0F 84 disp32` (je early_exit).
+    Same trick as the v21 callable: convert the conditional jump to an
+    unconditional one by overwriting `0F 84` with `90 E9` (nop+jmp) and
+    leaving the 32-bit displacement bytes intact, so the jmp lands exactly
+    where the je would have. v20.3 uses `je` instead of `jne` because the
+    underlying check returns 0 on success rather than non-zero."""
+    return (bytes(data[addr:addr + 35])
+            + bytes([0x90, 0xE9])
+            + bytes(data[addr + 37:addr + 41]))
+
+
 # --------------------------------------------------------------------- patch tables
 #
-# Each patch is `(pattern, replacement)`. Pattern indices are stable across
-# script versions so the --skip CLI flag stays meaningful.
+# Each patch is `(pattern, replacement)`.
 
-# Resolve 18.x / 19.x.
-PATCHES_OLD: "list[tuple[Pattern, Replacement]]" = [
-    (
-        [0x0F, 0x84, None, None, None, None, 0xE8, None, None, None, None,
-         0x33, 0xD2, 0x48, 0x8B, 0xC8, 0xE8, None, None, None, None,
-         0x84, 0xC0, 0x0F, 0x85],
-        bytes([0x90, 0xE9]),
-    ),
-    (
-        [0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x89, 0x51, 0x20, 0x48, 0x8B,
-         0xD9, 0xC6, 0x41, 0x24, 0x00, 0x83, 0xEA, 0x01, 0x74],
-        bytes([0xB0, 0x01, 0xC3]),
-    ),
-]
-
-# Resolve 21.x only. Index meaning:
-#   0:    v21-only — license-check chain function at VA 0x140D87010. Convert
+# Resolve 21.x. Index meaning:
+#   0:    license-check chain function at VA 0x140D87010 (v21.0.0.28). Convert
 #         the first `jne 0x140D8718C` to unconditional `jmp` so the function
 #         always takes the early-exit success path. Without this patch v21
 #         shows the License Key / Blackmagic Cloud ID chooser at startup;
-#         the call chain that produces it (license-check fn -> 0x14497D6D0
-#         with op-id 9 -> UiActivationDialogImp ctor) was confirmed via Frida.
+#         the call chain (license-check fn -> 0x14497D6D0 with op-id 9 ->
+#         UiActivationDialogImp ctor) was confirmed via Frida.
 PATCHES_21: "list[tuple[Pattern, Replacement]]" = [
     (
         [0x48, 0x89, 0x5C, 0x24, 0x10, 0x57,
@@ -143,6 +138,30 @@ PATCHES_21: "list[tuple[Pattern, Replacement]]" = [
          0x84, 0xC0,
          0x0F, 0x85, None, None, None, None],
         _force_first_jne_to_jmp,
+    ),
+]
+
+# Resolve 20.x. Index meaning:
+#   0:    license-check chain function at VA 0x143B0EC60 (v20.3.2.9). Same
+#         dialog-construction call chain as v21 (UiActivationDialogImp ctor
+#         is invoked from a license-op dispatcher with op-id 9 when no
+#         license check returns the "OK" sentinel value). Convert the
+#         first `je 0x143B0EDE9` (note: je on v20, not jne — the underlying
+#         license check returns 0 on success here) to unconditional `jmp`,
+#         forcing the early-exit success path. Confirmed via Frida.
+PATCHES_20: "list[tuple[Pattern, Replacement]]" = [
+    (
+        [0x48, 0x89, 0x5C, 0x24, 0x10, 0x57,
+         0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00,
+         0x33, 0xDB,
+         0xE8, None, None, None, None,
+         0x45, 0x33, 0xC0,
+         0x33, 0xD2,
+         0x48, 0x8B, 0xC8,
+         0xE8, None, None, None, None,
+         0x85, 0xC0,
+         0x0F, 0x84, None, None, None, None],
+        _force_first_je_to_jmp_v20,
     ),
 ]
 
@@ -170,13 +189,18 @@ def patch_4func(data: bytearray) -> None:
     """Locate a specific call (matched by an outer pattern), follow its rel32
     target, and flip a few `je` -> `jne` inside the destination function
     (the Dolby Vision license validator). Indices `[0]` and `[0, 1, 2]` were
-    chosen by the upstream Rust patcher against v20.x; they remain stable on
-    v21.0.x. Raises PatchError if patterns no longer match."""
+    chosen against v20.x and remain stable on v21.0.x.
+
+    Raises PatchError without mutating `data` if any pattern is missing —
+    we resolve every write site up front and only apply once everything is
+    found, so partial mutation can't escape this function."""
     outer_pattern = [0xE8, None, None, None, None, 0x88, 0x83, None, None, None, None,
                      0x48, 0x8D, 0x4C, 0x24, None, 0xFF, 0x15]
     occs = find_all(data, outer_pattern)
     if len(occs) != 1:
-        raise PatchError("Could not patch complex function.")
+        raise PatchError(
+            f"patch_4func: outer pattern matched {len(occs)} times instead of 1."
+        )
 
     call_addr = occs[0]
     rel32 = struct.unpack_from('<I', data, call_addr + 1)[0]
@@ -186,13 +210,20 @@ def patch_4func(data: bytearray) -> None:
         ([0x84, 0xC0, 0x0F, 0x84], bytes([0x84, 0xC0, 0x0F, 0x85]), [0]),
         ([0x85, 0xDB, 0x0F, 0x84], bytes([0x85, 0xDB, 0x0F, 0x85]), [0, 1, 2]),
     ]
+    # Resolve every write site up front so a missing inner pattern aborts
+    # before any byte is touched.
+    writes: list = []
     for sub_pat, repl, idxs in inner_patches:
         occs = find_all(data, sub_pat, fn_start, fn_start + 0x1000)
         for i in idxs:
             if i >= len(occs):
-                raise PatchError("Could not patch complex function.")
-            x = occs[i]
-            data[x:x + len(repl)] = repl
+                raise PatchError(
+                    f"patch_4func: inner pattern {bytes(b for b in sub_pat).hex()} "
+                    f"index {i} not found (only {len(occs)} hits in window)."
+                )
+            writes.append((occs[i], repl))
+    for off, repl in writes:
+        data[off:off + len(repl)] = repl
 
 
 # --------------------------------------------------------------------- license file & env var
@@ -269,31 +300,22 @@ def _atomic_write_with_retry(target: str, payload: bytes, action: str) -> None:
 # --------------------------------------------------------------------- main patch / restore
 
 def _select_patches(version: "tuple[int, int, int]") -> "list[tuple[Pattern, Replacement]]":
+    """Pick the patch table for the detected version. Only v20.x and v21.x
+    are supported."""
     major, minor, micro = version
-    if major < 18:
-        logger.warning(
-            "Resolve %d.%d.%d is older than supported. Recommended: 18.6.2, 20.x, 21.x",
-            major, minor, micro,
-        )
-        return PATCHES_OLD
-    if major in (18, 19):
-        if (major, minor) == (18, 6) and micro > 2:
-            logger.warning(
-                "Resolve %d.%d.%d may not be fully supported.",
-                major, minor, micro,
-            )
-        return PATCHES_OLD
+    if major == 20:
+        return PATCHES_20
     if major == 21:
         return PATCHES_21
-    logger.warning(
-        "Resolve %d.%d.%d is not v21.x. This script only supports v21.x.",
-        major, minor, micro,
+    raise PatchError(
+        f"Resolve {major}.{minor}.{micro} is unsupported. "
+        "This patcher only works on v20.x and v21.x."
     )
-    return PATCHES_21
 
 
 def patch(resolve_path: str) -> None:
-    """Patch Resolve.exe in place. Backs up to <path>.bak first."""
+    """Patch Resolve.exe in place. Backs up to <path>.bak first if and only
+    if any patch actually modified the binary."""
     try:
         with open(resolve_path, "rb") as f:
             data = bytearray(f.read())
@@ -304,6 +326,7 @@ def patch(resolve_path: str) -> None:
     logger.info("detected Resolve version %d.%d.%d", *version)
 
     patches = _select_patches(version)
+    modified = False
 
     for i, (sig, replacement) in enumerate(patches):
         occs = find_all(data, sig)
@@ -318,20 +341,29 @@ def patch(resolve_path: str) -> None:
         logger.info("patch[%d]: applying at file offset 0x%08X (%d bytes)",
                     i, addr, len(repl_bytes))
         data[addr:addr + len(repl_bytes)] = repl_bytes
+        modified = True
 
-    if version[0] >= 21:
+    if version[0] >= 20:
         try:
             patch_4func(data)
             logger.info("patch_4func: applied")
+            modified = True
         except PatchError as e:
             logger.warning("patch_4func: %s (continuing anyway)", e)
+
+    if not modified:
+        raise PatchError(
+            "No patches applied. Either this version is unsupported, the "
+            "binary is already patched, or the byte offsets have shifted."
+        )
 
     try:
         shutil.copy(resolve_path, resolve_path + ".bak")
     except OSError as e:
         raise PatchError(f"Unable to backup Resolve.exe: {e}") from e
 
-    _atomic_write_with_retry(resolve_path, bytes(data), action="write")
+    # bytearray is bytes-like — pass directly to avoid copying ~640 MB.
+    _atomic_write_with_retry(resolve_path, data, action="write")
 
     try:
         configure_license_file(resolve_path)
@@ -341,12 +373,40 @@ def patch(resolve_path: str) -> None:
 
 
 def restore(resolve_path: str) -> None:
-    """Restore Resolve.exe from <path>.bak."""
+    """Restore Resolve.exe from <path>.bak. Warns if the .bak's PE version
+    differs from the current binary's, since restoring across an upgrade
+    would replace the new install with the old one."""
     bak = resolve_path + ".bak"
     if not Path(bak).exists():
         raise PatchError(f"No backup found at {bak}")
     with open(bak, "rb") as f:
         bak_data = f.read()
+
+    # Cross-version sanity check: same major.minor.micro on both sides. The
+    # VS_FIXEDFILEINFO signature lives in the resource section near the end
+    # of the binary, so we have to scan the whole file (transient — released
+    # after this block).
+    try:
+        bak_version = determine_version(bak_data)
+    except PatchError:
+        bak_version = None
+    cur_version = None
+    try:
+        with open(resolve_path, "rb") as f:
+            cur_data = f.read()
+        cur_version = determine_version(cur_data)
+        del cur_data
+    except (OSError, PatchError):
+        pass
+    if bak_version and cur_version and bak_version != cur_version:
+        logger.warning(
+            "backup is %d.%d.%d but current Resolve.exe is %d.%d.%d — "
+            "restore would downgrade. Aborting. Delete %s manually if "
+            "you really want to overwrite.",
+            *bak_version, *cur_version, bak,
+        )
+        raise PatchError("backup version mismatch")
+
     _atomic_write_with_retry(resolve_path, bak_data, action="restore")
     logger.info("restored %s from %s", resolve_path, bak)
 
@@ -388,7 +448,7 @@ def locate() -> str:
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Patch DaVinci Resolve.exe (v21.x). Run as Administrator.",
+        description="Patch DaVinci Resolve.exe (v20.x / v21.x). Run as Administrator.",
     )
     p.add_argument("--restore", action="store_true",
                    help="restore Resolve.exe from .bak and exit")
@@ -398,48 +458,56 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _require_admin() -> None:
-    """Exit with an error if not running as Administrator."""
+    """Exit immediately if not running as Administrator on Windows.
+    On non-Windows, fail fast — the patcher uses winreg/ctypes-windll
+    further down and would crash anyway."""
     if sys.platform != "win32":
-        return
-    try:
-        if not ctypes.windll.shell32.IsUserAnAdmin():
-            logger.error("This script must be run as Administrator.")
-            logger.error("Right-click your terminal/PowerShell and choose 'Run as administrator'.")
-            raise SystemExit(1)
-    except AttributeError:
-        pass  # ctypes.windll may not exist on some platforms
+        logger.error("This script only runs on Windows.")
+        raise SystemExit(1)
+    if not ctypes.windll.shell32.IsUserAnAdmin():
+        logger.error("This script must be run as Administrator.")
+        logger.error("Right-click your terminal/PowerShell and choose 'Run as administrator'.")
+        raise SystemExit(1)
 
 
-def _kill_resolve() -> None:
-    """Kill Resolve.exe if it is running, waiting up to 10 seconds."""
+def _kill_resolve() -> bool:
+    """Kill any running Resolve.exe. Returns True if a process was killed,
+    False if there was nothing to kill or the kill failed."""
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["taskkill", "/F", "/IM", "Resolve.exe"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
         )
-        logger.info("killed Resolve.exe")
-    except OSError:
-        logger.debug("taskkill not available or failed")
+    except OSError as e:
+        logger.debug("taskkill unavailable: %s", e)
+        return False
+    if result.returncode == 0:
+        logger.info("killed running Resolve.exe")
+        return True
+    # taskkill returns 128 when no matching process exists — that's fine.
+    return False
 
 
 def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    args = _build_arg_parser().parse_args()  # exits cleanly on --help
+
     _require_admin()
     _kill_resolve()
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    args = _build_arg_parser().parse_args()
+
     try:
         path = args.path or locate()
-    except PatchError:
-        logger.error("unable to find resolve....")
+    except PatchError as e:
+        logger.error("unable to find Resolve.exe: %s", e)
         return 1
 
     try:
         if args.restore:
-            logger.info("attempting to restore resolve!")
+            logger.info("attempting to restore Resolve.exe!")
             restore(path)
         else:
-            logger.info("attempting to patch resolve!")
+            logger.info("attempting to patch Resolve.exe!")
             patch(path)
             logger.info("successfully patched!")
     except PatchError as e:
