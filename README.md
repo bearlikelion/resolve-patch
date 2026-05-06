@@ -31,5 +31,3 @@ python resolvepatch.py --path X     # specify custom Resolve.exe path
 python resolvepatch.py --restore
 ```
 
-## Video
-https://github.com/linuxadmin-sys/resolve-patch-win/raw/f570fdc86145964fb36c2559f89c2195acd178b7/Davinci.mov
