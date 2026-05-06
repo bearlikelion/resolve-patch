@@ -32,8 +32,4 @@ python resolvepatch.py --restore
 ```
 
 ## Video
-
-<video width="320" height="240" controls>
-  <source src="https://github.com/linuxadmin-sys/resolve-patch-win/raw/f570fdc86145964fb36c2559f89c2195acd178b7/Davinci.mov" type="video/quicktime">
-  Your browser does not support the video tag.
-</video>
+https://github.com/linuxadmin-sys/resolve-patch-win/raw/f570fdc86145964fb36c2559f89c2195acd178b7/Davinci.mov
