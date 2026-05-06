@@ -31,3 +31,7 @@ python resolvepatch.py --path X     # specify custom Resolve.exe path
 python resolvepatch.py --restore
 ```
 
+https://github.com/user-attachments/assets/950ba30f-1ee5-4f0b-9e53-4c085fc89fb0
+
+
+
