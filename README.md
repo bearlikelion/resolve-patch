@@ -62,4 +62,6 @@ it's reasonably priced for what it is.
 
 ## Demo
 
-https://github.com/user-attachments/assets/950ba30f-1ee5-4f0b-9e53-4c085fc89fb0
+https://github.com/user-attachments/assets/547f49ed-58d5-4b9c-9192-ec322302c4eb
+
+
