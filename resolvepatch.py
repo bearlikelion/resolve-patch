@@ -1,16 +1,23 @@
-"""resolvepatch — patch DaVinci Resolve.exe to bypass license checks.
+"""resolvepatch — patch DaVinci Resolve.exe and Fusion Studio's fusionsystem.dll
+to bypass license checks.
 
-Verified on Resolve 20.3.2.9 and 21.0.0.28 on Windows.
+Verified on:
+  - Resolve 20.3.2.9 and 21.0.0.28
+  - Fusion Studio 20.3.2 and 21.0.0.25
+on Windows.
 
 Usage (run as Administrator):
-    python resolvepatch.py                 # patch the auto-located Resolve.exe
-    python resolvepatch.py --restore       # restore from .bak
-    python resolvepatch.py --path <p>      # explicit Resolve.exe path
+    python resolvepatch.py                          # patch every detected target
+    python resolvepatch.py --restore                # restore everything from .bak
+    python resolvepatch.py --targets resolve        # only Resolve.exe
+    python resolvepatch.py --targets fusion         # only Fusion's fusionsystem.dll(s)
+    python resolvepatch.py --path <p>               # explicit Resolve.exe path
 """
 
 import argparse
 import ctypes
 import logging
+import msvcrt
 import os
 import re
 import shutil
@@ -28,6 +35,14 @@ logger = logging.getLogger("resolvepatch")
 # --------------------------------------------------------------------- constants
 
 DEFAULT_PATH = r"C:\Program Files\Blackmagic Design\DaVinci Resolve\Resolve.exe"
+
+# Standard install paths for Fusion Studio. The same pattern-based patch covers
+# both 20.x and 21.x — only the file offset within each DLL differs, and the
+# pattern matcher resolves that automatically.
+DEFAULT_FUSION_PATHS = (
+    r"C:\Program Files\Blackmagic Design\Fusion 21\fusionsystem.dll",
+    r"C:\Program Files\Blackmagic Design\Fusion 20\fusionsystem.dll",
+)
 
 # File extensions whose ShellOpen command points at Resolve.exe; used by the
 # auto-locator when the standard install path doesn't exist.
@@ -118,6 +133,19 @@ def _force_first_je_to_jmp_v20(data, addr, _sig):
             + bytes(data[addr + 37:addr + 41]))
 
 
+def _fusion_dolicensing_je_to_jmp_epilogue(data, addr, _sig):
+    """Fusion Studio activation-dialog bypass — see PATCHES_FUSION entry.
+
+    Pattern is 21 bytes; the last 2 are `74 11` (je rel8 +0x11), routing to
+    a THREAD_SPAWN block inside Fusion::FusionApp::DoLicensing(). Replace
+    those 2 bytes with `EB 71` (jmp rel8 +0x71) so control falls through to
+    the function's `mov al, 1; ret` epilogue instead. The first 19 bytes
+    (which include the version-specific [g_IsResolve] disp32) are preserved
+    verbatim. The `+0x71` displacement has been stable across observed
+    versions because the THREAD_SPAWN block has identical MSVC codegen."""
+    return bytes(data[addr:addr + 19]) + bytes([0xEB, 0x71])
+
+
 # --------------------------------------------------------------------- patch tables
 #
 # Each patch is `(pattern, replacement)`.
@@ -162,6 +190,38 @@ PATCHES_20: "list[tuple[Pattern, Replacement]]" = [
          0x85, 0xC0,
          0x0F, 0x84, None, None, None, None],
         _force_first_je_to_jmp_v20,
+    ),
+]
+
+# Fusion Studio activation-dialog bypass (covers v20.3.x and v21.0.x). Inside
+# Fusion::FusionApp::DoLicensing() the relevant code is:
+#     mov  rcx, rbx                ; 48 8B CB
+#     call qword [rax+0x220]       ; FF 90 20 02 00 00     (Log "Checking for licenses...")
+#     mov  rax, [g_IsResolve]      ; 48 8B 05 disp32        (disp32 is version-specific)
+#     cmp  byte [rax], 0           ; 80 38 00
+#     je   THREAD_SPAWN            ; 74 11
+# The je conditionally enters a block that allocates Events, registers a
+# callback in [g_handler], spawns a worker thread, and ResumeThread()s it.
+# That worker thread is what eventually requests the activation-key dialog.
+# Flipping `74 11` -> `EB 71` retargets the jmp to the function's
+# `mov al, 1; ret` epilogue, skipping the THREAD_SPAWN block entirely. As a
+# bonus, InitInstance's wait-for-license-message loop is gated by
+# `cmp [g_handler], <addr>` and skips itself when the handler is unset.
+#
+# Pattern length is 21 bytes (4 wildcards). An earlier 12-byte version
+# (mov rax,[mem]; cmp byte [rax],0; je +0x11) had two coincidental matches
+# elsewhere in the binary — likely other "is feature flag X enabled?"
+# checks — so the patcher's "matched > 1 time" guard would refuse to apply.
+# Anchoring on the preceding `48 8B CB FF 90 20 02 00 00` (mov rcx, rbx +
+# call vtable[0x220]) makes the match unique on both v20 and v21.
+PATCHES_FUSION: "list[tuple[Pattern, Replacement]]" = [
+    (
+        [0x48, 0x8B, 0xCB,
+         0xFF, 0x90, 0x20, 0x02, 0x00, 0x00,
+         0x48, 0x8B, 0x05, None, None, None, None,
+         0x80, 0x38, 0x00,
+         0x74, 0x11],
+        _fusion_dolicensing_je_to_jmp_epilogue,
     ),
 ]
 
@@ -411,6 +471,120 @@ def restore(resolve_path: str) -> None:
     logger.info("restored %s from %s", resolve_path, bak)
 
 
+# --------------------------------------------------------------------- state detection (no writes)
+
+def state_of_resolve(resolve_path: str) -> str:
+    """Classify a Resolve.exe install without modifying it.
+
+    Returns one of: MISSING (file not present), UNSUPPORTED (version not v20/v21),
+    UNPATCHED (the gate pattern still matches), PATCHED (no match — likely already
+    patched, or the pattern shifted in a future build)."""
+    if not Path(resolve_path).exists():
+        return "MISSING"
+    try:
+        with open(resolve_path, "rb") as f:
+            data = f.read()
+        version = determine_version(data)
+    except (OSError, PatchError):
+        return "UNSUPPORTED"
+    try:
+        patches = _select_patches(version)
+    except PatchError:
+        return "UNSUPPORTED"
+    for sig, _ in patches:
+        if find_all(data, sig):
+            return "UNPATCHED"
+    return "PATCHED"
+
+
+def state_of_fusion(dll_path: str) -> str:
+    """Classify a fusionsystem.dll install without modifying it.
+
+    Returns one of: MISSING / UNPATCHED / PATCHED."""
+    if not Path(dll_path).exists():
+        return "MISSING"
+    with open(dll_path, "rb") as f:
+        data = f.read()
+    for sig, _ in PATCHES_FUSION:
+        if find_all(data, sig):
+            return "UNPATCHED"
+    return "PATCHED"
+
+
+# --------------------------------------------------------------------- fusion patch / restore / locate
+
+def patch_fusion(dll_path: str) -> None:
+    """Patch fusionsystem.dll in place. Backs up to <path>.bak first if and
+    only if any patch actually modified the binary. Same atomic-write +
+    verify-by-readback pattern as the Resolve patch."""
+    try:
+        with open(dll_path, "rb") as f:
+            data = bytearray(f.read())
+    except OSError as e:
+        raise PatchError(f"could not read {dll_path}: {e}") from e
+
+    modified = False
+    for i, (sig, replacement) in enumerate(PATCHES_FUSION):
+        occs = find_all(data, sig)
+        if not occs:
+            logger.info("fusion patch[%d]: no match (already patched, "
+                        "or this version's layout differs)", i)
+            continue
+        if len(occs) > 1:
+            logger.warning("fusion patch[%d]: matched %d times — skipping",
+                           i, len(occs))
+            continue
+        addr = occs[0]
+        repl_bytes = replacement(data, addr, sig) if callable(replacement) else replacement
+        logger.info("fusion patch[%d]: applying at file offset 0x%08X (%d bytes)",
+                    i, addr, len(repl_bytes))
+        data[addr:addr + len(repl_bytes)] = repl_bytes
+        modified = True
+
+    if not modified:
+        raise PatchError(
+            f"No Fusion patches applied to {dll_path}. Either it's already "
+            "patched, this Fusion version is unsupported, or offsets shifted."
+        )
+
+    try:
+        shutil.copy(dll_path, dll_path + ".bak")
+    except OSError as e:
+        raise PatchError(f"unable to backup {dll_path}: {e}") from e
+
+    _atomic_write_with_retry(dll_path, bytes(data), action="write")
+
+
+def restore_fusion(dll_path: str) -> None:
+    """Restore fusionsystem.dll from <path>.bak. Unlike Resolve.exe there is
+    no embedded VS_FIXEDFILEINFO version on the DLL itself, so we skip the
+    cross-version sanity check — version is encoded in the install path and
+    each Fusion version has its own .bak."""
+    bak = dll_path + ".bak"
+    if not Path(bak).exists():
+        raise PatchError(f"No backup found at {bak}")
+    with open(bak, "rb") as f:
+        bak_data = f.read()
+    _atomic_write_with_retry(dll_path, bak_data, action="restore")
+    logger.info("restored %s from %s", dll_path, bak)
+
+
+def locate_fusion() -> "list[str]":
+    """Return all Fusion fusionsystem.dll paths actually present on disk."""
+    return [p for p in DEFAULT_FUSION_PATHS if Path(p).exists()]
+
+
+def _kill_fusion() -> None:
+    """Best-effort kill of any running Fusion processes that would lock the
+    DLL. Silently ignores missing processes."""
+    for image in ("Fusion.exe", "FusionServer.exe"):
+        try:
+            subprocess.run(["taskkill", "/F", "/IM", image],
+                           capture_output=True, text=True)
+        except OSError:
+            pass
+
+
 # --------------------------------------------------------------------- locate
 
 def _path_from_shellopen() -> Optional[str]:
@@ -448,12 +622,16 @@ def locate() -> str:
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Patch DaVinci Resolve.exe (v20.x / v21.x). Run as Administrator.",
+        description="Patch DaVinci Resolve.exe and/or Fusion Studio's "
+                    "fusionsystem.dll (v20.x / v21.x). Run as Administrator.",
     )
     p.add_argument("--restore", action="store_true",
-                   help="restore Resolve.exe from .bak and exit")
+                   help="restore from .bak files and exit (applies to all selected targets)")
     p.add_argument("--path", default=None,
                    help="explicit path to Resolve.exe (skips auto-locate)")
+    p.add_argument("--targets", default=None,
+                   help="non-interactive: comma-separated targets (resolve, fusion, all). "
+                        "If omitted on a TTY, an interactive menu is shown instead.")
     return p
 
 
@@ -489,31 +667,397 @@ def _kill_resolve() -> bool:
     return False
 
 
+def _parse_targets(spec: str) -> "set[str]":
+    """`--targets all` expands to {resolve, fusion}; comma-separated names
+    are validated against that set. Unknown names raise SystemExit via the
+    arg parser convention used elsewhere."""
+    valid = {"resolve", "fusion"}
+    raw = {t.strip().lower() for t in spec.split(",") if t.strip()}
+    if "all" in raw:
+        return valid
+    bad = raw - valid
+    if bad:
+        logger.error("unknown --targets value(s): %s (valid: resolve, fusion, all)",
+                     ", ".join(sorted(bad)))
+        raise SystemExit(2)
+    return raw
+
+
+# --------------------------------------------------------------------- interactive menu
+
+# A target row in the menu: (kind, label, path, state).
+# kind ∈ {"resolve", "fusion21", "fusion20"} — used by _execute to dispatch.
+def _build_target_rows(resolve_path: Optional[str]) -> "list[tuple[str, str, str, str]]":
+    rows: list[tuple[str, str, str, str]] = []
+    if resolve_path is not None:
+        rows.append(("resolve",
+                     "DaVinci Resolve.exe",
+                     resolve_path,
+                     state_of_resolve(resolve_path)))
+    else:
+        rows.append(("resolve",
+                     "DaVinci Resolve.exe",
+                     DEFAULT_PATH,
+                     "MISSING"))
+    for fp in DEFAULT_FUSION_PATHS:
+        version = "21" if "Fusion 21" in fp else "20"
+        rows.append((f"fusion{version}",
+                     f"Fusion Studio {version} (fusionsystem.dll)",
+                     fp,
+                     state_of_fusion(fp)))
+    return rows
+
+
+def _prompt(question: str) -> str:
+    """input() that gracefully handles Ctrl-C / EOF by returning ''."""
+    try:
+        return input(question)
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return ""
+
+
+# ----- arrow-key UI primitives (Windows console via msvcrt + ANSI escapes) -----
+
+def _enable_ansi() -> None:
+    """Best-effort: turn on ENABLE_VIRTUAL_TERMINAL_PROCESSING so ANSI escape
+    codes (cursor up, line clear) are interpreted instead of printed literally.
+    Modern Windows terminals have this on by default; this is a safety net for
+    older console hosts."""
+    try:
+        STD_OUTPUT_HANDLE = -11
+        ENABLE_VT = 0x0004
+        kernel32 = ctypes.windll.kernel32
+        h = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        mode = ctypes.c_ulong()
+        if kernel32.GetConsoleMode(h, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(h, mode.value | ENABLE_VT)
+    except Exception:
+        pass
+
+
+def _read_key() -> str:
+    """Block on a single keypress. Returns a normalized token:
+        'up' / 'down' / 'left' / 'right' / 'enter' / 'space' / 'escape',
+    or a lowercased single character (e.g. 'a', 'q'), or '' for unknown.
+    Raises KeyboardInterrupt on Ctrl-C."""
+    ch = msvcrt.getch()
+    # Special keys are two-byte sequences: \xe0 (or \x00) followed by a code.
+    if ch in (b'\xe0', b'\x00'):
+        ch2 = msvcrt.getch()
+        return {b'H': 'up', b'P': 'down', b'K': 'left', b'M': 'right'}.get(ch2, '')
+    if ch in (b'\r', b'\n'):
+        return 'enter'
+    if ch == b'\x1b':
+        return 'escape'
+    if ch == b' ':
+        return 'space'
+    if ch == b'\x03':
+        raise KeyboardInterrupt
+    try:
+        return ch.decode('utf-8', errors='replace').lower()
+    except UnicodeDecodeError:
+        return ''
+
+
+class _RedrawRegion:
+    """In-place menu redraw via ANSI cursor-up + line-clear. The first
+    `render()` just prints; subsequent calls overwrite the previous render
+    by going up N lines, clearing each, and re-printing.
+
+    Multi-line strings (i.e. items in `lines` that contain '\\n') are split
+    so each visual line gets its own `\\x1b[2K` clear and is counted in
+    `self.lines`. Without this split, the cursor-up would undercount and
+    drift downward by one line per redraw — leaving a growing gap above
+    the menu."""
+
+    def __init__(self) -> None:
+        self.lines: int = 0
+
+    def render(self, lines: "list[str]") -> None:
+        flat: list[str] = []
+        for line in lines:
+            flat.extend(line.split('\n'))
+        if self.lines:
+            sys.stdout.write(f'\r\x1b[{self.lines}A')
+        for line in flat:
+            sys.stdout.write('\x1b[2K' + line + '\n')
+        self.lines = len(flat)
+        sys.stdout.flush()
+
+
+def _arrow_single_select(header: str, options: "list[str]",
+                         footer: str = "") -> Optional[int]:
+    """Single-select arrow-key menu. Returns the chosen index, or None
+    if the user pressed q/escape."""
+    cursor = 0
+    region = _RedrawRegion()
+    while True:
+        lines = [header, ""]
+        for i, opt in enumerate(options):
+            mark = ">" if i == cursor else " "
+            lines.append(f" {mark} {opt}")
+        if footer:
+            lines.extend(["", footer])
+        region.render(lines)
+        try:
+            key = _read_key()
+        except KeyboardInterrupt:
+            return None
+        if key == 'up' and cursor > 0:
+            cursor -= 1
+        elif key == 'down' and cursor < len(options) - 1:
+            cursor += 1
+        elif key == 'enter':
+            return cursor
+        elif key in ('escape', 'q'):
+            return None
+
+
+def _arrow_multi_select(header: str, options: "list[str]",
+                        preselected: "Optional[set[int]]" = None,
+                        footer: str = "") -> "Optional[set[int]]":
+    """Multi-select arrow-key menu. SPACE toggles the current row, A toggles
+    all-vs-none, ENTER confirms. Returns set of chosen indices, or None on
+    cancel (q/escape) or if the user confirms with nothing selected."""
+    cursor = 0
+    selected: set[int] = set(preselected) if preselected else set()
+    region = _RedrawRegion()
+    while True:
+        lines = [header, ""]
+        for i, opt in enumerate(options):
+            arrow = ">" if i == cursor else " "
+            box = "[x]" if i in selected else "[ ]"
+            lines.append(f" {arrow} {box} {opt}")
+        if footer:
+            lines.extend(["", footer])
+        region.render(lines)
+        try:
+            key = _read_key()
+        except KeyboardInterrupt:
+            return None
+        if key == 'up' and cursor > 0:
+            cursor -= 1
+        elif key == 'down' and cursor < len(options) - 1:
+            cursor += 1
+        elif key == 'space':
+            if cursor in selected:
+                selected.discard(cursor)
+            else:
+                selected.add(cursor)
+        elif key == 'a':
+            selected = set() if len(selected) == len(options) else set(range(len(options)))
+        elif key == 'enter':
+            return selected if selected else None
+        elif key in ('escape', 'q'):
+            return None
+
+
+# ----- the menu itself --------------------------------------------------------
+
+def interactive_menu(resolve_path: Optional[str],
+                     action_filter: Optional[str] = None
+                     ) -> "tuple[Optional[str], list[tuple[str, str]]]":
+    """Arrow-key menu. If `action_filter` is None, the user picks patch vs
+    restore first. If 'patch' or 'restore' is passed, that step is skipped
+    (used by the smart `--restore` path).
+
+    For 'patch': lists all installed targets; UNPATCHED rows are pre-checked.
+    For 'restore': lists only PATCHED targets; all are pre-checked.
+
+    Returns (action, [(kind, path), ...]) or (None, []) on cancel."""
+    rows = _build_target_rows(resolve_path)
+
+    print()
+    print("=" * 72)
+    print("        Blackmagic Design Patcher  -  DaVinci Resolve & Fusion")
+    print("=" * 72)
+
+    if action_filter is None:
+        idx = _arrow_single_select(
+            header="\nWhat do you want to do?",
+            options=["Patch installed targets",
+                     "Restore from .bak",
+                     "Quit"],
+            footer="(Up/Down to move, Enter to confirm, q/Esc to cancel)",
+        )
+        if idx is None or idx == 2:
+            return None, []
+        action = "patch" if idx == 0 else "restore"
+    else:
+        action = action_filter
+
+    if action == "patch":
+        relevant = [r for r in rows if r[3] in ("UNPATCHED", "PATCHED", "UNSUPPORTED")]
+        preselect = {i for i, r in enumerate(relevant) if r[3] == "UNPATCHED"}
+    else:  # restore
+        relevant = [r for r in rows if r[3] == "PATCHED"]
+        preselect = set(range(len(relevant)))
+
+    if not relevant:
+        if action == "patch":
+            print("\nNo installed targets to patch.\n")
+        else:
+            print("\nNothing to restore (no targets are currently patched).\n")
+        return None, []
+
+    option_lines = [f"{label:42s}  {state}" for _kind, label, _path, state in relevant]
+    verb = action.upper()
+
+    chosen_idx = _arrow_multi_select(
+        header=f"\nSelect targets to {verb}:",
+        options=option_lines,
+        preselected=preselect,
+        footer="(Up/Down move, Space toggle, A all/none, Enter confirm, q/Esc cancel)",
+    )
+    if not chosen_idx:
+        print("\nCancelled (no targets selected).\n")
+        return None, []
+
+    print()
+    print(f"About to {verb}:")
+    for i in sorted(chosen_idx):
+        _kind, label, _path, state = relevant[i]
+        note = ""
+        if action == "patch" and state == "PATCHED":
+            note = "  (already patched - will be a no-op)"
+        elif action == "restore" and state != "PATCHED":
+            note = f"  (current state: {state})"
+        print(f"  - {label}{note}")
+    print()
+
+    confirm_idx = _arrow_single_select(
+        header="Continue?",
+        options=["Yes, proceed", "No, cancel"],
+        footer="(Up/Down + Enter, or q/Esc to cancel)",
+    )
+    if confirm_idx != 0:
+        print("\nCancelled.\n")
+        return None, []
+
+    chosen = [(relevant[i][0], relevant[i][2]) for i in sorted(chosen_idx)]
+    return action, chosen
+
+
+def _execute(action: str, chosen: "list[tuple[str, str]]") -> int:
+    """Run `action` ('patch'|'restore') against the chosen [(kind, path), ...].
+    Each kill is deferred until just before its first relevant work — so we
+    never kill Fusion if only Resolve was selected, and vice versa."""
+    rc = 0
+    resolve_picked = [(k, p) for k, p in chosen if k == "resolve"]
+    fusion_picked = [(k, p) for k, p in chosen if k.startswith("fusion")]
+
+    if resolve_picked:
+        _kill_resolve()
+        for _kind, path in resolve_picked:
+            try:
+                if action == "restore":
+                    logger.info("attempting to restore Resolve.exe!")
+                    restore(path)
+                    logger.info("successfully restored Resolve.exe")
+                else:
+                    logger.info("attempting to patch Resolve.exe!")
+                    patch(path)
+                    logger.info("successfully patched Resolve.exe")
+            except PatchError as e:
+                logger.error("Resolve failed: %s", e)
+                rc = 1
+
+    if fusion_picked:
+        _kill_fusion()
+        for _kind, path in fusion_picked:
+            try:
+                if action == "restore":
+                    logger.info("attempting to restore: %s", path)
+                    restore_fusion(path)
+                    logger.info("successfully restored: %s", path)
+                else:
+                    logger.info("attempting to patch: %s", path)
+                    patch_fusion(path)
+                    logger.info("successfully patched: %s", path)
+            except PatchError as e:
+                logger.error("Fusion failed (%s): %s", path, e)
+                rc = 1
+
+    return rc
+
+
+def _resolve_chosen_from_cli(targets_spec: str, resolve_path: Optional[str]) -> "list[tuple[str, str]]":
+    """Translate a `--targets` string into the `chosen` list shape used by
+    _execute. Skips MISSING installs silently — same behaviour as the menu."""
+    targets = _parse_targets(targets_spec)
+    chosen: list[tuple[str, str]] = []
+    if "resolve" in targets and resolve_path is not None:
+        chosen.append(("resolve", resolve_path))
+    if "fusion" in targets:
+        for fp in locate_fusion():
+            kind = "fusion21" if "Fusion 21" in fp else "fusion20"
+            chosen.append((kind, fp))
+    return chosen
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = _build_arg_parser().parse_args()  # exits cleanly on --help
 
     _require_admin()
-    _kill_resolve()
+    _enable_ansi()
 
+    # Auto-locate Resolve. Missing-install isn't fatal at this point — the
+    # menu / CLI dispatch handles it.
+    resolve_path: Optional[str] = None
     try:
-        path = args.path or locate()
-    except PatchError as e:
-        logger.error("unable to find Resolve.exe: %s", e)
-        return 1
+        resolve_path = args.path or locate()
+    except PatchError:
+        resolve_path = None
 
-    try:
-        if args.restore:
-            logger.info("attempting to restore Resolve.exe!")
-            restore(path)
-        else:
-            logger.info("attempting to patch Resolve.exe!")
-            patch(path)
-            logger.info("successfully patched!")
-    except PatchError as e:
-        logger.error("failed: %s", e)
-        return 1
-    return 0
+    # ---- explicit CLI mode (scripted / unattended) --------------------------
+    # `--targets` given, OR stdin isn't a TTY: bypass menus entirely.
+    if args.targets is not None or not sys.stdin.isatty():
+        targets_spec = args.targets or "all"
+        chosen = _resolve_chosen_from_cli(targets_spec, resolve_path)
+        if not chosen:
+            logger.info("nothing to do (no targets resolved)")
+            return 0
+        action = "restore" if args.restore else "patch"
+        return _execute(action, chosen)
+
+    # ---- interactive flow ---------------------------------------------------
+
+    if args.restore:
+        # Smart --restore: skip the menu when 0 or 1 targets are patched.
+        rows = _build_target_rows(resolve_path)
+        patched = [r for r in rows if r[3] == "PATCHED"]
+
+        if not patched:
+            logger.info("nothing to restore (no targets are currently patched)")
+            return 0
+
+        if len(patched) == 1:
+            kind, label, path, _state = patched[0]
+            print()
+            print(f"Single patched install detected: {label}")
+            print(f"  {path}")
+            print()
+            confirm_idx = _arrow_single_select(
+                header=f"Restore {label} from .bak?",
+                options=["Yes, restore", "No, cancel"],
+                footer="(Up/Down + Enter, or q/Esc to cancel)",
+            )
+            if confirm_idx != 0:
+                print("\nCancelled.\n")
+                return 0
+            return _execute("restore", [(kind, path)])
+
+        # 2+ patched: full menu, but skip the patch/restore choice (filtered
+        # to restore action only — and only patched rows are listed).
+        action, chosen = interactive_menu(resolve_path, action_filter="restore")
+    else:
+        action, chosen = interactive_menu(resolve_path, action_filter=None)
+
+    if action is None or not chosen:
+        return 0
+    return _execute(action, chosen)
 
 
 if __name__ == "__main__":
