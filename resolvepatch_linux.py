@@ -89,7 +89,7 @@ def _jne_to_jmp(data: bytearray, addr: int, sig) -> bytes:
     return bytes(result)
 
 
-PATCHES_LINUX_21 = [
+PATCHES_LINUX_21_0 = [
     # Patch 0: license-check dispatcher (op-ids 0,3,4,13,5).
     # All checks fail -> je jumps to error/dialog path. NOP the je so
     # execution always falls through to the success return.
@@ -120,21 +120,53 @@ PATCHES_LINUX_21 = [
     ),
 ]
 
+# Resolve 21.1.x (verified on 21.1.1.0010)
+# Same dispatcher structure as 21.0.x; only the je/jne displacement bytes differ.
+PATCHES_LINUX_21_1 = [
+    # Patch 0: license-check dispatcher (op-ids 0,3,4,13,5).
+    #   be 05 00 00 00   mov esi, 5
+    #   e8 XX XX XX XX   call <check_fn>    (wildcard)
+    #   84 c0            test al, al
+    #   0f 84 d1 00 00 00  je <error_path>  <- NOP this
+    (
+        [0xBE, 0x05, 0x00, 0x00, 0x00,
+         0xE8, None, None, None, None,
+         0x84, 0xC0,
+         0x0F, 0x84, 0xD1, 0x00, 0x00, 0x00],
+        _nop_je,
+    ),
+    # Patch 1: secondary license check.
+    #   b3 01            mov bl, 1
+    #   e8 XX XX XX XX   call <check_fn>    (wildcard)
+    #   84 c0            test al, al
+    #   0f 85 c9 00 00 00  jne <success>    <- force unconditional jmp
+    (
+        [0xB3, 0x01,
+         0xE8, None, None, None, None,
+         0x84, 0xC0,
+         0x0F, 0x85, 0xC9, 0x00, 0x00, 0x00],
+        _jne_to_jmp,
+    ),
+]
+
 
 # ------------------------------------------------------------------ version detection
 
 def detect_version(data: bytes) -> tuple:
-    """Extract version from null-delimited build string (e.g. '\x0021.0.0b.0028\x00')."""
-    m = re.search(rb"\x00(\d+)\.(\d+)\.(\d+)b\.\d+\x00", data)
+    """Extract version from null-delimited build string (e.g. '\x0021.0.0b.0028\x00' or '\x0021.1.1.0010\x00')."""
+    m = re.search(rb"\x00(\d+)\.(\d+)\.(\d+)(?:b\.)?\.(\d+)\x00", data)
     if m:
         return int(m.group(1)), int(m.group(2)), int(m.group(3))
     return (0, 0, 0)
 
 
 def select_patches(version: tuple) -> list:
-    major = version[0]
+    major, minor = version[0], version[1]
     if major == 21:
-        return PATCHES_LINUX_21
+        if minor == 0:
+            return PATCHES_LINUX_21_0
+        if minor >= 1:
+            return PATCHES_LINUX_21_1
     raise PatchError(
         f"Resolve {version[0]}.{version[1]}.{version[2]} is not supported. "
         "Only v21.x is currently supported by this Linux patcher."
